@@ -27,13 +27,27 @@ for ($i = 1; $i -le 10; $i++) {
 }
 
 Write-Host "正在检查图片文件..." -ForegroundColor Yellow
+$imgPaths = @()
+$supportedFormats = @("png", "jpg", "jpeg", "bmp", "webp", "tiff", "tif")
+
 for ($i = 1; $i -le 10; $i++) {
-    $imgFile = Join-Path $imgDir "$i.jpg"
-    if (-not (Test-Path $imgFile)) { Write-Host "错误: 找不到 $imgFile" -ForegroundColor Red; exit 1 }
-    Write-Host "  找到 $i.jpg" -ForegroundColor Green
+    $found = $false
+    foreach ($ext in $supportedFormats) {
+        $imgFile = Join-Path $imgDir "$i.$ext"
+        if (Test-Path $imgFile) {
+            $imgPaths += $imgFile
+            Write-Host "  找到 $i.$ext" -ForegroundColor Green
+            $found = $true
+            break
+        }
+    }
+    if (-not $found) {
+        Write-Host "错误: 找不到图片 $i (支持格式: $($supportedFormats -join ', '))" -ForegroundColor Red
+        exit 1
+    }
 }
 
-$firstImg = Join-Path $imgDir "1.jpg"
+$firstImg = $imgPaths[0]
 $sizeInfo = & $ffprobePath -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$firstImg"
 $width, $height = $sizeInfo -split 'x'
 $width = [int]$width
@@ -46,8 +60,12 @@ Write-Host "开始构建 ffmpeg 命令..." -ForegroundColor Yellow
 
 $inputs = ""
 for ($i = 1; $i -le 10; $i++) {
-    $imgPath = Join-Path $imgDir "$i.jpg"
-    $dur = $durations[$i-1] + 1.5
+    $imgPath = $imgPaths[$i-1]
+    if ($i -eq 1) {
+        $dur = $durations[$i-1]
+    } else {
+        $dur = $durations[$i-1] + 0.5
+    }
     $inputs += "-loop 1 -framerate 60 -t $dur -i `"$imgPath`" "
 }
 for ($i = 1; $i -le 10; $i++) {
@@ -55,27 +73,30 @@ for ($i = 1; $i -le 10; $i++) {
     $inputs += "-i `"$audioPath`" "
 }
 
+# 使用 xfade 滤镜实现真正的转场效果
 $filterParts = @()
-for ($i = 1; $i -le 10; $i++) {
+
+# 第一张图片：不需要淡入，只需要缩放
+$filterParts += "[0:v]scale={0}:-2,setsar=1,format=yuv420p[v1]" -f $width
+
+# 后续图片：缩放处理
+for ($i = 2; $i -le 10; $i++) {
     $vidx = $i - 1
-    $fadeOutStart = [math]::Round($durations[$vidx], 3)
-    $st = [math]::Round($startTimes[$vidx], 3)
-    if ($i -eq 1) {
-        $filterParts += "[{0}:v]setpts=PTS-STARTPTS,fade=t=out:st={1}:d=1.5,setpts=PTS+{2}/TB[v{3}]" -f $vidx, $fadeOutStart, $st, $i
-    } else {
-        $filterParts += "[{0}:v]setpts=PTS-STARTPTS,fade=t=in:st=0:d=1.5,fade=t=out:st={1}:d=1.5,setpts=PTS+{2}/TB[v{3}]" -f $vidx, $fadeOutStart, $st, $i
-    }
+    $filterParts += "[{0}:v]scale={1}:-2,setsar=1,format=yuv420p[v{2}]" -f $vidx, $width, $i
 }
 
-$totalDuration = [math]::Round(($startTimes[9] + $durations[9]), 3)
-$filterParts += "color=c=black:s={0}:d={1}:r=60[base]" -f $sizeInfo, $totalDuration
-$filterParts += "[base][v1]overlay=format=auto[tmp1]"
+# 使用 xfade 连接所有图片
+$xfadeChain = "[v1]"
 for ($i = 2; $i -le 10; $i++) {
-    $prev = $i - 1
-    if ($i -eq 10) {
-        $filterParts += "[tmp{0}][v{1}]overlay=format=auto[vout]" -f $prev, $i
+    $offset = [math]::Round($startTimes[$i-2] + $durations[$i-2] - 0.5, 3)
+    if ($i -eq 2) {
+        $filterParts += "[v1][v2]xfade=transition=fade:duration=0.5:offset={0}[vx2]" -f $offset
+        $xfadeChain = "[vx2]"
+    } elseif ($i -eq 10) {
+        $filterParts += "{0}[v{1}]xfade=transition=fade:duration=0.5:offset={2}[vout]" -f $xfadeChain, $i, $offset
     } else {
-        $filterParts += "[tmp{0}][v{1}]overlay=format=auto[tmp{1}]" -f $prev, $i
+        $filterParts += "{0}[v{1}]xfade=transition=fade:duration=0.5:offset={2}[vx{1}]" -f $xfadeChain, $i, $offset
+        $xfadeChain = "[vx{0}]" -f $i
     }
 }
 
@@ -87,6 +108,13 @@ for ($i = 1; $i -le 10; $i++) {
 $audioConcat = ($audioParts -join "") + "concat=n=10:v=0:a=1[aout]"
 $filterParts += $audioConcat
 $filter = $filterParts -join "; "
+
+$totalDuration = [math]::Round(($startTimes[9] + $durations[9]), 3)
+
+# 调试：打印滤镜命令
+Write-Host "`n=== 生成的滤镜命令 ===" -ForegroundColor Magenta
+Write-Host $filter -ForegroundColor Gray
+Write-Host "======================`n" -ForegroundColor Magenta
 
 Write-Host "预计视频总时长: $totalDuration 秒" -ForegroundColor Cyan
 $outputPath = Join-Path $scriptDir $OutputFile
